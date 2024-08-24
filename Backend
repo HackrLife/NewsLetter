@@ -1,0 +1,198 @@
+// server.js
+const express = require('express');
+const mongoose = require('mongoose');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const cors = require('cors');
+const nodemailer = require('nodemailer');
+
+const app = express();
+app.use(express.json());
+app.use(cors());
+
+// Connect to MongoDB
+mongoose.connect('mongodb://localhost/newsletter_app', { useNewUrlParser: true, useUnifiedTopology: true });
+
+// User model
+const User = mongoose.model('User', {
+  email: String,
+  password: String,
+  newsletters: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Newsletter' }],
+  subscriptions: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Newsletter' }]
+});
+
+// Newsletter model
+const Newsletter = mongoose.model('Newsletter', {
+  name: String,
+  description: String,
+  author: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  subscribers: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+  posts: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Post' }],
+  isPaid: Boolean,
+  price: Number,
+  analytics: {
+    views: Number,
+    subscriptions: Number,
+    unsubscriptions: Number
+  }
+});
+
+// Post model
+const Post = mongoose.model('Post', {
+  title: String,
+  content: String,
+  newsletter: { type: mongoose.Schema.Types.ObjectId, ref: 'Newsletter' },
+  createdAt: Date
+});
+
+// Authentication middleware
+const auth = (req, res, next) => {
+  try {
+    const token = req.header('Authorization').replace('Bearer ', '');
+    const decoded = jwt.verify(token, 'secret_key');
+    req.userId = decoded.userId;
+    next();
+  } catch (error) {
+    res.status(401).send({ error: 'Please authenticate.' });
+  }
+};
+
+// User registration
+app.post('/register', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const hashedPassword = await bcrypt.hash(password, 8);
+    const user = new User({ email, password: hashedPassword });
+    await user.save();
+    res.status(201).send({ message: 'User registered successfully' });
+  } catch (error) {
+    res.status(400).send(error);
+  }
+});
+
+// User login
+app.post('/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const user = await User.findOne({ email });
+    if (!user || !(await bcrypt.compare(password, user.password))) {
+      throw new Error('Invalid login credentials');
+    }
+    const token = jwt.sign({ userId: user._id }, 'secret_key');
+    res.send({ token });
+  } catch (error) {
+    res.status(400).send(error.message);
+  }
+});
+
+// Create newsletter
+app.post('/newsletters', auth, async (req, res) => {
+  try {
+    const { name, description, isPaid, price } = req.body;
+    const newsletter = new Newsletter({ name, description, author: req.userId, isPaid, price });
+    await newsletter.save();
+    await User.findByIdAndUpdate(req.userId, { $push: { newsletters: newsletter._id } });
+    res.status(201).send(newsletter);
+  } catch (error) {
+    res.status(400).send(error);
+  }
+});
+
+// Get user's newsletters
+app.get('/newsletters', auth, async (req, res) => {
+  try {
+    const user = await User.findById(req.userId).populate('newsletters');
+    res.send(user.newsletters);
+  } catch (error) {
+    res.status(500).send(error);
+  }
+});
+
+// Create post
+app.post('/posts', auth, async (req, res) => {
+  try {
+    const { title, content, newsletterId } = req.body;
+    const post = new Post({ title, content, newsletter: newsletterId, createdAt: new Date() });
+    await post.save();
+    await Newsletter.findByIdAndUpdate(newsletterId, { $push: { posts: post._id } });
+    res.status(201).send(post);
+  } catch (error) {
+    res.status(400).send(error);
+  }
+});
+
+// Subscribe to newsletter
+app.post('/subscribe', auth, async (req, res) => {
+  try {
+    const { newsletterId } = req.body;
+    await User.findByIdAndUpdate(req.userId, { $addToSet: { subscriptions: newsletterId } });
+    await Newsletter.findByIdAndUpdate(newsletterId, { 
+      $addToSet: { subscribers: req.userId },
+      $inc: { 'analytics.subscriptions': 1 }
+    });
+    res.send({ message: 'Subscribed successfully' });
+  } catch (error) {
+    res.status(400).send(error);
+  }
+});
+
+// Unsubscribe from newsletter
+app.post('/unsubscribe', auth, async (req, res) => {
+  try {
+    const { newsletterId } = req.body;
+    await User.findByIdAndUpdate(req.userId, { $pull: { subscriptions: newsletterId } });
+    await Newsletter.findByIdAndUpdate(newsletterId, { 
+      $pull: { subscribers: req.userId },
+      $inc: { 'analytics.unsubscriptions': 1 }
+    });
+    res.send({ message: 'Unsubscribed successfully' });
+  } catch (error) {
+    res.status(400).send(error);
+  }
+});
+
+// Get newsletter analytics
+app.get('/analytics/:newsletterId', auth, async (req, res) => {
+  try {
+    const newsletter = await Newsletter.findById(req.params.newsletterId);
+    if (newsletter.author.toString() !== req.userId) {
+      return res.status(403).send({ error: 'Not authorized to view analytics' });
+    }
+    res.send(newsletter.analytics);
+  } catch (error) {
+    res.status(500).send(error);
+  }
+});
+
+// Send newsletter email
+app.post('/send-newsletter', auth, async (req, res) => {
+  try {
+    const { newsletterId, subject, content } = req.body;
+    const newsletter = await Newsletter.findById(newsletterId).populate('subscribers');
+    
+    // Configure nodemailer (replace with your email service details)
+    const transporter = nodemailer.createTransport({
+      service: 'gmail',
+      auth: {
+        user: 'your-email@gmail.com',
+        pass: 'your-password'
+      }
+    });
+
+    for (let subscriber of newsletter.subscribers) {
+      await transporter.sendMail({
+        from: 'your-email@gmail.com',
+        to: subscriber.email,
+        subject: subject,
+        html: content
+      });
+    }
+
+    res.send({ message: 'Newsletter sent successfully' });
+  } catch (error) {
+    res.status(500).send(error);
+  }
+});
+
+const port = 3000;
+app.listen(port, () => console.log(`Server running on port ${port}`));
